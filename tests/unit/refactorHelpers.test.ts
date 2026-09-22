@@ -4,7 +4,6 @@ import { ApiError } from '../../src/lib/api'
 import { toBookmarkPayload, toCategoryPayload } from '../../src/lib/adminFormAdapters'
 import {
   applySortOrder,
-  buildOrderedBookmarkIdsForCategory,
   buildPublicDataAfterCategoryDelete,
   removeById,
   updateBookmarkIconBlob,
@@ -101,21 +100,6 @@ describe('refactored helper modules', () => {
     })
   })
 
-  it('derives global sort order from category-local bookmark sorting', () => {
-    expect(applySortOrder([categoryA, categoryB], [1, 2]).map((category) => ({
-      id: category.id,
-      sort: category.sort,
-    }))).toEqual([
-      { id: 1, sort: 0 },
-      { id: 2, sort: 1 },
-    ])
-
-    expect(buildOrderedBookmarkIdsForCategory([
-      { ...bookmarkA, id: 10, category_id: 1, sort: 0 },
-      { ...bookmarkB, id: 11, category_id: 2, sort: 1 },
-      { ...bookmarkA, id: 12, category_id: 1, sort: 2 },
-    ], 1, [12, 10])).toEqual([12, 11, 10])
-  })
 
   it('builds home sorting, grouping, and search indexes outside the view', () => {
     const memo = createHomeDataMemo()
@@ -141,6 +125,9 @@ describe('refactored helper modules', () => {
       icon: 'tool',
       parent_id: null,
     })
+    expect(toCategoryPayload({ parent_id: null, title: 'Home', icon: ' mdi/home ' }).icon).toBe(
+      'https://api.iconify.design/mdi/home.svg',
+    )
 
     expect(toBookmarkPayload({
       category_id: '2',
@@ -165,6 +152,8 @@ describe('refactored helper modules', () => {
 
     expect(form.category_id).toBe(9)
     expect(getIconifySearchQuery(' mdi:home ')).toBe('mdi:home')
+    expect(getIconifySearchQuery(' image upload ')).toBe('image upload')
+    expect(getIconifySearchQuery(' h o m e ')).toBe('home')
     expect(getIconifySearchQuery('x')).toBe('')
     expect(buildBookmarkSubmitPayload(form, '')).toMatchObject({
       title: 'Site',

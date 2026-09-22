@@ -44,6 +44,7 @@
   let confirmedIconifyName = ''
   let iconifySearchState: BookmarkIconifySearchState = createBookmarkIconifySearchState()
   let iconifySearchTimer: ReturnType<typeof setTimeout> | null = null
+  let iconifySearchAbortController: AbortController | null = null
   let iconifyError = ''
 
   $: nextKey = JSON.stringify({ open, mode, value })
@@ -65,7 +66,7 @@
     iconifyName = iconifySelection.iconifyName
     iconifyUseConfirmed = iconifySelection.iconifyUseConfirmed
     confirmedIconifyName = iconifySelection.confirmedIconifyName
-    iconifySearchState = createBookmarkIconifySearchState()
+    iconifySearchState = createBookmarkIconifySearchState(iconifySearchState.requestId)
     clearIconifySearchTimer()
   }
 
@@ -93,6 +94,8 @@
       clearTimeout(iconifySearchTimer)
       iconifySearchTimer = null
     }
+    iconifySearchAbortController?.abort()
+    iconifySearchAbortController = null
   }
 
   function scheduleIconifyCandidateSearch(enabled: boolean, value: string) {
@@ -110,17 +113,22 @@
   }
 
   async function loadIconifyCandidates(query: string, requestId: number) {
+    const controller = new AbortController()
+    iconifySearchAbortController = controller
     try {
-      const result = await iconifyApi.search(query)
+      const result = await iconifyApi.search(query, controller.signal)
       iconifySearchState = resolveBookmarkIconifySearchSuccess(iconifySearchState, {
         requestId,
         candidates: result.candidates,
       })
     } catch (searchError) {
+      if (controller.signal.aborted) return
       iconifySearchState = resolveBookmarkIconifySearchError(iconifySearchState, {
         requestId,
         error: getErrorMessage(searchError),
       })
+    } finally {
+      if (iconifySearchAbortController === controller) iconifySearchAbortController = null
     }
   }
 
@@ -148,7 +156,7 @@
     iconifyUseConfirmed = false
     confirmedIconifyName = ''
     iconifyError = ''
-    iconifySearchState = createBookmarkIconifySearchState()
+    iconifySearchState = createBookmarkIconifySearchState(iconifySearchState.requestId)
     clearIconifySearchTimer()
   }
 
@@ -242,6 +250,14 @@
               </button>
             {/if}
           </div>
+        </label>
+
+        <label class="visibility-toggle">
+          <input bind:checked={form.is_private} type="checkbox" />
+          <span>
+            <strong>访客不可见（仅登录可见）</strong>
+            <small>开启后，未登录访客看不到此分类、子分类及其中的书签。</small>
+          </span>
         </label>
 
         <IconifySelector
@@ -357,16 +373,49 @@
     background: #ffffff;
   }
 
-  input:focus {
+  input:focus-visible {
     outline: none;
     border-color: #2563eb;
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+    box-shadow: 0 0 0 3px var(--focus-ring);
   }
 
   .error-text {
     margin: 0;
     color: #dc2626;
     font-size: 13px;
+  }
+
+  .visibility-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid #dbe4ef;
+    border-radius: var(--radius-lg);
+    background: #f8fafc;
+  }
+
+  .visibility-toggle input {
+    width: 18px;
+    min-height: 18px;
+    margin: 2px 0 0;
+    accent-color: #2563eb;
+  }
+
+  .visibility-toggle span {
+    display: grid;
+    gap: 4px;
+  }
+
+  .visibility-toggle strong {
+    color: #0f172a;
+    font-size: 14px;
+  }
+
+  .visibility-toggle small {
+    color: #64748b;
+    font-size: 12px;
+    line-height: 1.45;
   }
 
   .icon-row {

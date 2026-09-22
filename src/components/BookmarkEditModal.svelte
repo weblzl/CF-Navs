@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte'
+  import { setPageScrollLocked } from '../lib/pageScrollLock'
   import {
     DEFAULT_LOGO_SURF_SCHEME,
     getIconCandidates,
@@ -69,9 +70,8 @@
   let confirmedIconifyName = ''
   let iconifySearchState: BookmarkIconifySearchState = createBookmarkIconifySearchState()
   let iconifySearchTimer: ReturnType<typeof setTimeout> | null = null
+  let iconifySearchAbortController: AbortController | null = null
   let titleLookupState: BookmarkTitleState = createBookmarkTitleState()
-  let previousBodyOverflow: string | null = null
-  let previousDocumentOverflow: string | null = null
 
   // 当前链接下的图标候选
   let candidates: IconCandidate[] = []
@@ -94,7 +94,7 @@
     iconifyName = iconifySelection.iconifyName
     iconifyUseConfirmed = iconifySelection.iconifyUseConfirmed
     confirmedIconifyName = iconifySelection.confirmedIconifyName
-    iconifySearchState = createBookmarkIconifySearchState()
+    iconifySearchState = createBookmarkIconifySearchState(iconifySearchState.requestId)
     // 弹窗是单例，requestId 必须接着上一轮往下走，否则上一轮在途的响应会污染新表单。
     titleLookupState = createBookmarkTitleState(titleLookupState.requestId)
     // 编辑模式也重新生成候选
@@ -147,6 +147,8 @@
       clearTimeout(iconifySearchTimer)
       iconifySearchTimer = null
     }
+    iconifySearchAbortController?.abort()
+    iconifySearchAbortController = null
   }
 
   function scheduleIconifyCandidateSearch(enabled: boolean, value: string) {
@@ -164,17 +166,22 @@
   }
 
   async function loadIconifyCandidates(query: string, requestId: number) {
+    const controller = new AbortController()
+    iconifySearchAbortController = controller
     try {
-      const result = await iconifyApi.search(query)
+      const result = await iconifyApi.search(query, controller.signal)
       iconifySearchState = resolveBookmarkIconifySearchSuccess(iconifySearchState, {
         requestId,
         candidates: result.candidates,
       })
     } catch (searchError) {
+      if (controller.signal.aborted) return
       iconifySearchState = resolveBookmarkIconifySearchError(iconifySearchState, {
         requestId,
         error: getErrorMessage(searchError),
       })
+    } finally {
+      if (iconifySearchAbortController === controller) iconifySearchAbortController = null
     }
   }
 
@@ -254,25 +261,6 @@
     window.open('https://icon-sets.iconify.design/', '_blank', 'noopener,noreferrer')
   }
 
-  function setPageScrollLocked(locked: boolean) {
-    if (typeof document === 'undefined') return
-
-    if (locked && previousBodyOverflow === null) {
-      previousBodyOverflow = document.body.style.overflow
-      previousDocumentOverflow = document.documentElement.style.overflow
-      document.documentElement.style.overflow = 'hidden'
-      document.body.style.overflow = 'hidden'
-      return
-    }
-
-    if (!locked && previousBodyOverflow !== null) {
-      document.documentElement.style.overflow = previousDocumentOverflow ?? ''
-      document.body.style.overflow = previousBodyOverflow
-      previousBodyOverflow = null
-      previousDocumentOverflow = null
-    }
-  }
-
   function selectCandidate(candidate: IconCandidate) {
     if (candidate.source === 'logo_surf') {
       selectLogoColorScheme(DEFAULT_LOGO_SURF_SCHEME)
@@ -341,6 +329,7 @@
           bind:title={form.title}
           bind:url={form.url}
           bind:openMethod={form.open_method}
+          bind:isPrivate={form.is_private}
           bind:description={form.description}
           bind:descriptionMode={form.description_mode}
           {categories}

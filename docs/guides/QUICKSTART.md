@@ -85,9 +85,6 @@ npx wrangler deploy
 
 4. 保存并完成首轮生产部署。Cloudflare 的 Git 引导流程会根据 `wrangler.toml` 中不带 ID 的声明创建并绑定 `DB` D1 数据库与 `SESSION` KV 命名空间。
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/lbjxr/CF-Navs/main/docs/screenshots/cf-deploy3.jpg" alt="在 Cloudflare Worker 中添加 SETUP_TOKEN 密钥" width="100%">
-</p>
 
 5. 首轮部署完成后，在该 Worker 的 **设置 → 变量和密钥** 中选择**生产环境**，添加一个类型为**密钥**的变量，变量名填写 `SETUP_TOKEN`，值填写一段足够长且随机的字符串。
 6. 保存 Secret 后重新触发生产分支部署。打开部署后的 Workers URL，并访问 `/install`。输入 `SETUP_TOKEN`，再设置管理员用户名和密码；安装器会初始化数据库 schema 和管理员账号。
@@ -118,7 +115,7 @@ npx wrangler deploy
 - 添加书签和分类
 - 新增书签时选择文字图标配色方案
 - 登录后在首页右键书签进行快捷编辑
-- 在“外观与卡片”中选择配色、卡片展示方式；需要时展开背景、尺寸和卡片表面高级设置
+- 在“外观与卡片”中选择配色和卡片展示方式；在“高级与视觉”中配置背景、尺寸、卡片表面和分类标题视觉
 - 配置搜索引擎
 - 在“站点信息”中配置首页标题显示、搜索框、搜索引擎选择器和“经常访问”展示数量
 - 在“访问分析”中查看书签点击排行与零访问书签

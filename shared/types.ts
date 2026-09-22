@@ -8,6 +8,7 @@ export interface Category {
   parent_id: number | null
   title: string
   icon: string | null
+  is_private?: boolean | number // 公开分类为 0/false，私密分类为 1/true
   sort: number
   created_at: number
 }
@@ -25,6 +26,7 @@ export interface Bookmark {
   description: string | null
   description_mode?: DescriptionDisplayMode | null
   open_method: 1 | 2 | 3 // 1=新窗口 2=当前页 3=当前页弹层
+  is_private?: boolean | number // 公开书签为 0/false，私密书签为 1/true
   sort: number
   click_count?: number
   created_at: number
@@ -103,6 +105,13 @@ export interface CardSizeSetting {
   height: number // 卡片最小高度 (px)
 }
 
+export interface CategoryDisplaySetting {
+  root_font_size: number // 一级分类标题字号 (12-28px)
+  root_icon_size: number // 一级分类图标尺寸 (14-36px)
+  child_font_size: number // 二级分类标题字号 (11-24px)
+  child_icon_size: number // 二级分类图标尺寸 (12-32px)
+}
+
 export interface ContentLayoutSetting {
   max_width: number
   max_width_unit: 'px' | '%'
@@ -114,6 +123,7 @@ export interface ContentLayoutSetting {
 export interface NavigationSetting {
   position: 'left' | 'top'
   always_expanded: boolean
+  top_layout: 'scroll' | 'wrap'
 }
 
 // 卡片风格类型
@@ -125,8 +135,11 @@ export interface Settings {
   site_title_color: string
   site_title_font_size: number
   public_mode: boolean
+  browser_sync_enabled: boolean
   theme: ThemeMode
   background_preset_id: BackgroundPresetId
+  custom_accent_color: string
+  custom_dark_accent_color: string
   background: BackgroundSetting // 兼容旧版本：新逻辑优先使用 backgrounds
   backgrounds: ThemeBackgroundSettings
   custom_css: string
@@ -136,6 +149,7 @@ export interface Settings {
   card_size: CardSizeSetting
   card_style: CardStyle // 新增：卡片风格
   card_icon_size: number // 新增：图标尺寸 (px)
+  category_display: CategoryDisplaySetting
   card_show_description: boolean // 新增：是否显示描述（详情风格）
   card_description_mode: DescriptionDisplayMode
   card_background_color: string // 卡片背景颜色，例如 '#ffffff'
@@ -199,6 +213,16 @@ export interface LoginResp {
   username: string
 }
 
+// POST /api/logout
+// 撤销名单是「退出登录」的全部实质：会话是无状态 JWT，不写名单就等于没退。
+// 因此写入失败必须能被调用方分辨，不能一律当成纯成功。
+export type LogoutRevocationFailure =
+  | 'store_unavailable' // SESSION KV 存在但写入抛错
+  | 'store_unconfigured' // 部署缺少 SESSION 绑定，撤销被整体跳过
+export type LogoutResp =
+  | { revoked: true }
+  | { revoked: false; reason: LogoutRevocationFailure }
+
 // GET /api/install/status
 export type InstallBinding = 'DB' | 'SESSION'
 export type InstallStatusResp =
@@ -218,6 +242,11 @@ export interface InstallReq {
 export interface ChangePasswordReq {
   current_password: string
   new_password: string
+}
+
+// POST /api/recover （已安装实例上用 SETUP_TOKEN 重置管理员密码，只改密码不改用户名）
+export interface RecoverReq {
+  password: string
 }
 
 // GET /api/public/data  （公开只读聚合）
@@ -250,6 +279,8 @@ export interface PublicSettings {
   site_title_font_size: number
   theme: ThemeMode
   background_preset_id: BackgroundPresetId
+  custom_accent_color: string
+  custom_dark_accent_color: string
   background: BackgroundSetting // 兼容旧版本：新逻辑优先使用 backgrounds
   backgrounds: ThemeBackgroundSettings
   search_engine: SearchEngineSetting
@@ -257,6 +288,7 @@ export interface PublicSettings {
   card_size: CardSizeSetting // 添加卡片尺寸
   card_style: CardStyle // 添加卡片风格
   card_icon_size: number // 添加图标尺寸
+  category_display: CategoryDisplaySetting
   card_show_description: boolean // 添加描述显示开关
   card_description_mode: DescriptionDisplayMode
   card_background_color: string
@@ -285,6 +317,7 @@ export interface CategoryUpsertReq {
   title: string
   icon?: string | null
   parent_id?: number | null
+  is_private?: boolean
 }
 
 // POST/PUT 书签
@@ -298,6 +331,24 @@ export interface BookmarkUpsertReq {
   description?: string | null
   description_mode?: DescriptionDisplayMode | null
   open_method?: 1 | 2 | 3
+  is_private?: boolean
+}
+
+// POST /api/browser-sync/bookmarks —— 浏览器扩展单向同步
+export interface BrowserSyncBookmark {
+  title: string
+  url: string
+}
+
+export interface BrowserSyncReq {
+  bookmarks: BrowserSyncBookmark[]
+}
+
+export interface BrowserSyncResp {
+  category_id: number
+  category_title: string
+  created: number
+  skipped: number
 }
 
 // GET /api/fetch-favicon?url=...
@@ -329,10 +380,49 @@ export interface IconifySearchResp {
   candidates: IconifyCandidate[]
 }
 
+// GET /api/icon-access（需登录）
+// 后台预览私密书签/私密分类图标用的短期授权。`<img>` 不发 Authorization 头，所以凭据
+// 只能放进 URL 的 `key` 参数。签名密钥是 `settings.jwt_secret`，改密码会顺带作废全部
+// 授权；寿命刻意远短于会话（默认 30 分钟），因为它不查撤销名单、登出后无法立即失效。
+export interface IconAccessResp {
+  key: string
+  expires_at: number
+}
+
 // POST /api/categories/sort  和  /api/bookmarks/sort
 // 传有序 id 数组，后端按下标写 sort
 export interface SortReq {
   ids: number[]
+}
+
+/** 首页跨分类拖拽后，按分类提交完整的书签顺序。 */
+export interface BookmarkReorganizeReq {
+  category_orders: Array<{
+    category_id: number
+    ids: number[]
+  }>
+}
+
+export type BookmarkBatchMovePosition = 'end' | 'start'
+
+export interface BookmarkBatchMoveExpected {
+  id: number
+  category_id: number
+  sort: number
+}
+
+/** POST /api/bookmarks/batch-move 的请求。expected 用于拒绝过期选择。 */
+export interface BookmarkBatchMoveReq {
+  ids: number[]
+  category_id: number
+  position: BookmarkBatchMovePosition
+  expected: BookmarkBatchMoveExpected[]
+}
+
+export interface BookmarkBatchMoveResp {
+  moved: number
+  category_id: number
+  position: BookmarkBatchMovePosition
 }
 
 export interface CategorySortReq extends SortReq {

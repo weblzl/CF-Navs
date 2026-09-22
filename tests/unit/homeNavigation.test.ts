@@ -93,6 +93,7 @@ describe('home navigation helpers', () => {
 
   it('defaults every root group to direct bookmarks and accepts only its own children', () => {
     expect(resolveHomeCategoryForRoot(forest[0], undefined).id).toBe(1)
+    expect(resolveHomeCategoryForRoot(forest[0], undefined, groupedBookmarks).id).toBe(1)
     expect(resolveHomeCategoryForRoot(forest[0], 'category-3').id).toBe(3)
     expect(resolveHomeCategoryForRoot(forest[0], 3).id).toBe(3)
     expect(resolveHomeCategoryForRoot(forest[0], 'category-2').id).toBe(1)
@@ -102,6 +103,19 @@ describe('home navigation helpers', () => {
       { root: 1, selected: 3 },
       { root: 2, selected: 2 },
     ])
+  })
+  it('仅在没有显式选择时回退到首个子分类', () => {
+    const emptyRoot = buildCategoryForest([
+      { id: 4, parent_id: null, title: 'Empty root', icon: null, sort: 0 },
+      { id: 5, parent_id: 4, title: 'First child', icon: null, sort: 0 },
+    ])[0]
+    const bookmarks = new Map([[5, [bookmark(5, 5)]]])
+
+    expect(resolveHomeCategoryForRoot(emptyRoot, undefined, bookmarks).id).toBe(5)
+    expect(resolveHomeCategoryForRoot(emptyRoot, 4, bookmarks).id).toBe(4)
+    expect(resolveHomeCategoryForRoot(emptyRoot, 'category-4', bookmarks).id).toBe(4)
+    expect(getHomeCategoryGroups([emptyRoot], new Map([[4, 4]]), bookmarks)[0].selected.id).toBe(4)
+    expect(getHomeCategoryGroups([emptyRoot], new Map(), bookmarks)[0].selected.id).toBe(5)
   })
 
   it('tracks the last root above the navigation threshold or the first root below it', () => {
@@ -115,6 +129,17 @@ describe('home navigation helpers', () => {
       [2, 620],
     ]), 96)).toBe(1)
     expect(resolveActiveHomeRootId(new Map(), 96)).toBeNull()
+  })
+
+  it('excludes private bookmarks from most-visited results', () => {
+    const items = [
+      { ...bookmark(1, 1), click_count: 4, is_private: true },
+      { ...bookmark(2, 1), click_count: 3, is_private: 1 },
+      { ...bookmark(3, 1), click_count: 2, is_private: false },
+      { ...bookmark(4, 1), click_count: 1 },
+    ]
+
+    expect(getMostVisitedBookmarks(items, 10).map((item) => item.id)).toEqual([3, 4])
   })
 
   it('selects positive most-visited bookmarks without mutating the source', () => {

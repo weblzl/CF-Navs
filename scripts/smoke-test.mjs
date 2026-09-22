@@ -4,6 +4,7 @@
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:8787'
 const USER = process.env.ADMIN_USER || 'admin'
 const PASS = process.env.ADMIN_PASS || 'replace-with-a-local-dev-password'
+const SETUP_TOKEN = process.env.SETUP_TOKEN || ''
 
 let pass = 0
 let fail = 0
@@ -20,8 +21,8 @@ function check(name, cond, detail = '') {
   }
 }
 
-async function call(path, { method = 'GET', token, body } = {}) {
-  const headers = { accept: 'application/json' }
+async function call(path, { method = 'GET', token, body, headers: extraHeaders } = {}) {
+  const headers = { accept: 'application/json', ...extraHeaders }
   if (body !== undefined) headers['content-type'] = 'application/json'
   if (token) headers['authorization'] = `Bearer ${token}`
   const res = await fetch(`${BASE}${path}`, {
@@ -128,8 +129,14 @@ async function main() {
     check('更新后标题生效', r.json?.data?.title === '常用工具(改)', r.json?.data?.title)
   }
   {
-    const r = await call('/api/categories/sort', { method: 'POST', token, body: { ids: [catB.id, catA.id] } })
-    check('分类排序 code=0', r.json?.code === 0)
+    // 顶层分类排序：PR #7 起 /api/categories/sort 按 CategorySortReq 要求 parent_id，
+    // 顶层传 null（`worker/routes/categories.ts` sort 路由）。
+    const r = await call('/api/categories/sort', {
+      method: 'POST',
+      token,
+      body: { parent_id: null, ids: [catB.id, catA.id] },
+    })
+    check('分类排序 code=0', r.json?.code === 0, JSON.stringify(r.json))
     const list = (await call('/api/categories', { token })).json?.data || []
     check('排序后 B 在前', list[0]?.id === catB.id, `first=${list[0]?.id} expect=${catB.id}`)
   }
@@ -314,7 +321,19 @@ async function main() {
     const bms = (await call('/api/bookmarks', { token })).json?.data || []
     check('导入后分类被覆盖为 2 个', cats.length === 2, `len=${cats.length}`)
     check('导入后书签被覆盖为 2 个', bms.length === 2)
-    check('导入保留原始 id', cats.some((c) => c.id === 101) && bms.some((b) => b.id === 201))
+    // 导入按 remapImportRecords 从 1 起重编号（root 先于 child），并把书签的
+    // category_id 重绑到新分类 id；原始 id 不保留，这是既有设计而非缺陷。
+    const sortedCatIds = cats.map((c) => c.id).sort((a, b) => a - b)
+    check('导入分类按 remap 从 1 起重编号', sortedCatIds.join(',') === '1,2', `ids=${sortedCatIds.join(',')}`)
+    check('导入未保留原始分类 id', !cats.some((c) => c.id === 101 || c.id === 102), `ids=${sortedCatIds.join(',')}`)
+    const catTitleById = new Map(cats.map((c) => [c.id, c.title]))
+    const bmA = bms.find((b) => b.title === '导入书签1')
+    const bmB = bms.find((b) => b.title === '导入书签2')
+    check(
+      '书签 category_id 重绑到正确分类',
+      catTitleById.get(bmA?.category_id) === '导入分类A' && catTitleById.get(bmB?.category_id) === '导入分类B',
+      `bm1→${catTitleById.get(bmA?.category_id)} bm2→${catTitleById.get(bmB?.category_id)}`,
+    )
     const s = (await call('/api/settings', { token })).json?.data
     check('导入应用了 settings.site_title', s?.site_title === '导入后的标题', s?.site_title)
   }
@@ -345,6 +364,40 @@ async function main() {
     check('登出 code=0', r.json?.code === 0)
     const after = await call('/api/me', { token })
     check('登出后 token 失效 → 401', after.status === 401, `status=${after.status}`)
+  }
+
+  // 15. 密码恢复（放最后：会重置密码并轮换 JWT secret，作废全部会话）
+  section('密码恢复 /api/recover')
+  if (!SETUP_TOKEN) {
+    check('SETUP_TOKEN 未配置，跳过恢复场景', true, 'skipped')
+  } else {
+    const NEW_PASS = 'recovNew1'
+    {
+      const r = await call('/api/recover', { method: 'POST', body: { password: NEW_PASS }, headers: { 'X-Setup-Token': 'wrong-token' } })
+      check('恢复错误令牌 → 401', r.status === 401, `status=${r.status}`)
+    }
+    {
+      const r = await call('/api/recover', { method: 'POST', body: { password: NEW_PASS } })
+      check('恢复缺令牌头 → 401', r.status === 401, `status=${r.status}`)
+    }
+    {
+      const r = await call('/api/recover', { method: 'POST', body: { password: 'short1' }, headers: { 'X-Setup-Token': SETUP_TOKEN } })
+      check('恢复弱密码 → 1002', r.json?.code === 1002, `code=${r.json?.code}`)
+    }
+    {
+      const r = await call('/api/recover', { method: 'POST', body: { password: NEW_PASS }, headers: { 'X-Setup-Token': SETUP_TOKEN } })
+      check('恢复成功 code=0', r.json?.code === 0, JSON.stringify(r.json))
+      check('恢复返回原用户名', r.json?.data?.username === USER, `u=${r.json?.data?.username}`)
+      check('恢复返回可用 token', typeof r.json?.data?.token === 'string' && r.json.data.token.length > 0)
+    }
+    {
+      const r = await call('/api/login', { method: 'POST', body: { username: USER, password: NEW_PASS } })
+      check('新密码可登录 code=0', r.json?.code === 0, JSON.stringify(r.json))
+    }
+    {
+      const r = await call('/api/login', { method: 'POST', body: { username: USER, password: PASS } })
+      check('旧密码登录被拒绝', r.json?.code !== 0, `code=${r.json?.code}`)
+    }
   }
 
   finish()

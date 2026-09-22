@@ -85,12 +85,19 @@ export function groupBookmarksByCategory(items: PublicBookmark[]): Map<number, P
   return grouped
 }
 
+// 「经常访问」是首页最显眼的公共区块，私密书签不进入该区块：
+// 访客侧后端已过滤，管理员登录后拿到的是全量数据，必须在此处一并排除，
+// 否则管理员与访客看到的构成不同，后台实时预览也无法反映真实效果。
 export function getMostVisitedBookmarks(items: PublicBookmark[], limit: number): PublicBookmark[] {
   const normalizedLimit = Math.max(0, Math.floor(Number(limit) || 0))
   if (normalizedLimit === 0) return []
 
   return items
-    .filter((bookmark) => (bookmark.click_count ?? 0) > 0)
+    .filter((bookmark) => (
+      (bookmark.click_count ?? 0) > 0
+      && bookmark.is_private !== true
+      && bookmark.is_private !== 1
+    ))
     .sort((a, b) => (
       (b.click_count ?? 0) - (a.click_count ?? 0)
       || a.sort - b.sort
@@ -163,22 +170,28 @@ export function resolveHomeCategorySelection(
 export function resolveHomeCategoryForRoot(
   root: CategoryNode<PublicCategory>,
   activeId: string | number | null | undefined,
+  categoryBookmarks?: ReadonlyMap<number, PublicBookmark[]>,
 ): CategoryNode<PublicCategory> {
   const normalizedId = String(activeId ?? '')
+  const defaultCategory = categoryBookmarks && (categoryBookmarks.get(root.id)?.length ?? 0) === 0 && root.children.length > 0
+    ? root.children[0]
+    : root
+
   if (normalizedId === String(root.id) || normalizedId === `category-${root.id}`) return root
 
   return root.children.find((child) => (
     normalizedId === String(child.id) || normalizedId === `category-${child.id}`
-  )) ?? root
+  )) ?? defaultCategory
 }
 
 export function getHomeCategoryGroups(
   forest: CategoryNode<PublicCategory>[],
   selectedCategoryIds: ReadonlyMap<number, number>,
+  categoryBookmarks?: ReadonlyMap<number, PublicBookmark[]>,
 ): HomeCategoryGroup[] {
   return forest.map((root) => ({
     root,
-    selected: resolveHomeCategoryForRoot(root, selectedCategoryIds.get(root.id)),
+    selected: resolveHomeCategoryForRoot(root, selectedCategoryIds.get(root.id), categoryBookmarks),
   }))
 }
 

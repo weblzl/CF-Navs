@@ -11,9 +11,11 @@
     filterAdminCategoryGroups,
     flattenAdminCategoryGroups,
     getAdminSortIds,
+    getHiddenCategoryIds,
     reorderAdminSortDraft,
   } from '../../lib/adminListState'
-  import { createIconVersion } from '../../lib/bookmarkIconDisplay'
+  import CategoryIcon from '../CategoryIcon.svelte'
+  import { iconAccessKey } from '../../lib/iconAccessKey'
   import { sortableList } from '../../lib/sortableList'
   import './adminListPanels.css'
 
@@ -47,6 +49,7 @@
   let trackedCategorySearch = ''
 
   $: categoryGroups = buildAdminCategoryGroups(categories)
+  $: hiddenCategoryIds = getHiddenCategoryIds(categories)
   $: filteredGroups = filterAdminCategoryGroups(categoryGroups, search)
   $: totalPages = getAdminListTotalPages(filteredGroups.length)
   $: page = clampAdminListPage(page, totalPages)
@@ -149,11 +152,12 @@
     }
   }
 
-  function getCategoryIconUrl(category: AdminCategory): string {
-    const icon = category.icon?.trim()
-    if (!icon || (!/^https?:\/\//i.test(icon) && !icon.startsWith('data:image/'))) return ''
-
-    return `/api/category-icon/${category.id}?v=${createIconVersion(`${category.id}:${icon}:${category.title}`)}`
+  function toCategoryIconValue(category: AdminCategory) {
+    return {
+      id: Number(category.id),
+      title: category.title,
+      icon: category.icon ?? '',
+    }
   }
 </script>
 
@@ -177,7 +181,7 @@
     <div class="admin-list-panel-header">
       <div>
         <p class="admin-panel-eyebrow">分类</p>
-        <div class="admin-title-row"><h2>分类列表</h2><div class="admin-bookmark-search-bar"><input type="text" data-testid="admin-category-search" placeholder="搜索分类…" value={search} on:input={handleSearchInput} /></div></div>
+        <div class="admin-title-row"><h2>分类列表</h2><div class="admin-bookmark-search-bar"><input type="text" data-testid="admin-category-search" aria-label="搜索分类" placeholder="搜索分类…" value={search} on:input={handleSearchInput} /></div></div>
       </div>
       <div class="admin-header-actions-row">
         {#if !sortMode}
@@ -236,13 +240,11 @@
             {#each displayCategories as category (category.id)}
               <article class="admin-compact-card sortable" data-sortable-item data-sort-id={category.id}>
                 <span class="admin-drag-handle" aria-hidden="true">⋮⋮</span>
-                <span class="admin-icon-badge">
-                  {#if getCategoryIconUrl(category)}
-                    <img src={getCategoryIconUrl(category)} alt="" loading="lazy" />
-                  {:else}
-                    {category.icon || '📁'}
-                  {/if}
-                </span>
+                {#if category.icon?.trim()}
+                  <CategoryIcon category={toCategoryIconValue(category)} size={28} className="admin-icon-badge" iconAccessKey={hiddenCategoryIds.has(Number(category.id)) ? $iconAccessKey : ''} imageLoading="eager" />
+                {:else}
+                  <span class="admin-icon-badge">📁</span>
+                {/if}
                 <div class="admin-compact-info">
                   <h3>{category.title}</h3>
                   <span class="admin-count-badge">{getAdminCategoryBookmarkCount(category, bookmarks)} 个直属书签</span>
@@ -270,17 +272,16 @@
                 {:else}
                   <span class="admin-tree-toggle-spacer" aria-hidden="true"></span>
                 {/if}
-                <span class="admin-icon-badge">
-                  {#if getCategoryIconUrl(group.root)}
-                    <img src={getCategoryIconUrl(group.root)} alt="" loading="lazy" />
-                  {:else}
-                    {group.root.icon || '📁'}
-                  {/if}
-                </span>
+                {#if group.root.icon?.trim()}
+                  <CategoryIcon category={toCategoryIconValue(group.root)} size={28} className="admin-icon-badge" iconAccessKey={hiddenCategoryIds.has(Number(group.root.id)) ? $iconAccessKey : ''} imageLoading="eager" />
+                {:else}
+                  <span class="admin-icon-badge">📁</span>
+                {/if}
                 <div class="admin-compact-info">
                   <h3>{group.root.title}</h3>
                   <span class="admin-count-badge">{getAdminCategoryBookmarkCount(group.root, bookmarks)} 个直属书签</span>
                   <span class="admin-count-badge">{group.children.length} 个子分类</span>
+                  {#if group.root.is_private}<span class="admin-private-badge">仅登录可见</span>{/if}
                 </div>
                 <div class="admin-inline-actions">
                   {#if group.children.length > 1}
@@ -302,17 +303,16 @@
                     <article class="admin-compact-card admin-child-category-card" data-category-id={category.id}>
                       <input type="checkbox" aria-label={`选择分类 ${category.title}`} checked={selectedIds.has(Number(category.id))} on:change={(event) => toggleCategorySelection(event, Number(category.id))} />
                       <span class="admin-hierarchy-connector" aria-hidden="true">↳</span>
-                      <span class="admin-icon-badge">
-                        {#if getCategoryIconUrl(category)}
-                          <img src={getCategoryIconUrl(category)} alt="" loading="lazy" />
-                        {:else}
-                          {category.icon || '📁'}
-                        {/if}
-                      </span>
+                      {#if category.icon?.trim()}
+                        <CategoryIcon category={toCategoryIconValue(category)} size={28} className="admin-icon-badge" iconAccessKey={hiddenCategoryIds.has(Number(category.id)) ? $iconAccessKey : ''} imageLoading="eager" />
+                      {:else}
+                        <span class="admin-icon-badge">📁</span>
+                      {/if}
                       <div class="admin-compact-info">
                         <h3>{category.title}</h3>
                         <span class="admin-parent-path">{group.root.title} / {category.title}</span>
                         <span class="admin-count-badge">{getAdminCategoryBookmarkCount(category, bookmarks)} 个直属书签</span>
+                        {#if category.is_private}<span class="admin-private-badge">仅登录可见</span>{/if}
                       </div>
                       <div class="admin-inline-actions">
                         <button type="button" class="admin-sm-button" on:click={() => onEditCategory?.(category)} disabled={!isAuthenticated}>编辑</button>
@@ -382,7 +382,7 @@
     font: inherit;
   }
 
-  .admin-bookmark-search-bar input:focus {
+  .admin-bookmark-search-bar input:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--admin-accent) 32%, transparent);
     outline-offset: 1px;
   }
@@ -550,6 +550,17 @@
     white-space: nowrap;
   }
 
+  .admin-private-badge {
+    flex-shrink: 0;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: color-mix(in srgb, #f59e0b 16%, var(--admin-card-bg));
+    color: #b45309;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
   .admin-sm-button {
     border-radius: 8px;
     padding: 3px 10px;
@@ -582,12 +593,6 @@
     opacity: 0.6;
   }
 
-  .admin-icon-badge img {
-    width: 18px;
-    height: 18px;
-    object-fit: contain;
-    display: block;
-  }
 
   @media (max-width: 960px) {
     .admin-compact-card {

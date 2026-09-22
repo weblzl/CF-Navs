@@ -1,23 +1,31 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte'
+  import { onDestroy, onMount, tick } from 'svelte'
   import { get } from 'svelte/store'
   import { fade } from 'svelte/transition'
   import {
-    type Bookmark,
-    type Category,
+    type BookmarkBatchMoveReq,
+    type BookmarkReorganizeReq,
     type ChangePasswordReq,
+    type LoginResp,
+    type PublicBookmark,
+    type Settings,
     type ThemeMode,
   } from '../shared/types'
   import ConfirmDialog from './components/ConfirmDialog.svelte'
   import Toast from './components/Toast.svelte'
   import Home from './views/Home.svelte'
   import Install from './views/Install.svelte'
+  import Recover from './views/Recover.svelte'
+  import BookmarkLinkModal from './components/BookmarkLinkModal.svelte'
   import { api, getErrorMessage, isUnauthorizedError } from './lib/api'
+  import type { BackupSelection as BackupSelectionInput } from './lib/appBackup'
   import { clearCachedAdminData } from './lib/adminDataCache'
   import { clearCachedPublicData } from './lib/publicDataCache'
   import { toastStore } from './lib/toast'
   import type { AdminTab, BookmarkFormValue, CategoryFormValue } from './lib/adminTypes'
   import { toBookmarkForm, toBookmarkPayload, toCategoryForm, toCategoryPayload } from './lib/adminFormAdapters'
+  import { runAdminMutation } from './lib/appAdminMutation'
+  import { logoutRevocationWarning } from './lib/appAuthController'
   import {
     createImportExportState,
     exportDataToFile,
@@ -50,6 +58,7 @@
     hasInstalledHint,
     installationCommittedAfterFailure,
     isInstallPath,
+    isRecoverPath,
     normalizeInstallError,
     replaceBrowserPath,
     setInstalledHint,
@@ -58,7 +67,6 @@
     toInstallScreenState,
     type InstallScreenState,
   } from './lib/appInstall'
-  import { buildOrderedBookmarkIdsForCategory } from './lib/appLocalData'
   import { createBookmarkDraft, createCategoryDraft, findBookmarkForEdit } from './lib/appModalState'
   import {
     canSeeHomeView,
@@ -72,6 +80,7 @@
   import { getNextThemePreference, resolveAppThemeState } from './lib/appThemeState'
   import type { ImportSource } from './lib/importData'
   import { pruneBookmarkIconCacheStorageBackedByLocalStorage } from './lib/localBookmarkIconCache'
+  import { installPublicDataFocusRefresh } from './lib/publicDataFocusRefresh'
   import { adminStore, authStore, configStore, isAuthenticated, publicStore } from './lib/stores'
   import { readPreferredThemeMode, writePreferredThemeMode } from './lib/themePreference'
   import {
@@ -101,6 +110,7 @@
 
   let booting = true
   let installState: InstallScreenState = { type: 'checking' }
+  let recoverActive = false
   let rootError = ''
   // 数据加载失败时的原始异常，用来判断是否需要回头复核安装状态。
   let lastDataError: unknown = null
@@ -113,6 +123,8 @@
   let AdminComponent: typeof import('./views/Admin.svelte').default | null = null
   let LoginModalComponent: typeof import('./components/LoginModal.svelte').default | null = null
   let BookmarkEditModalComponent: typeof import('./components/BookmarkEditModal.svelte').default | null = null
+  let CategoryEditModalComponent: typeof import('./components/CategoryEditModal.svelte').default | null = null
+  let SearchSpotlightComponent: typeof import('./components/SearchSpotlight.svelte').default | null = null
   let confirmDialog: ConfirmDialogState | null = null
   let confirmDialogResolver: ((confirmed: boolean) => void) | null = null
 
@@ -139,10 +151,81 @@
       BookmarkEditModalComponent = component
     },
   })
+  const ensureCategoryEditModalComponent = createLazyComponentLoader({
+    load: () => import('./components/CategoryEditModal.svelte'),
+    getCurrent: () => CategoryEditModalComponent,
+    setCurrent: (component) => {
+      CategoryEditModalComponent = component
+    },
+  })
+
+  const ensureSearchSpotlightComponent = createLazyComponentLoader({
+    load: () => import('./components/SearchSpotlight.svelte'),
+    getCurrent: () => SearchSpotlightComponent,
+    setCurrent: (component) => {
+      SearchSpotlightComponent = component
+    },
+  })
 
   let loginModalOpen = false
   let categoryModalOpen = false
   let bookmarkModalOpen = false
+  let categoryCreateReturnToHome = false
+  let homeFocusCategoryId: number | null = null
+  let spotlightOpen = false
+  let viewBookmark: PublicBookmark | null = null
+
+  function anyBlockingModalOpen(): boolean {
+    return loginModalOpen || categoryModalOpen || bookmarkModalOpen || Boolean(confirmDialog) || Boolean(viewBookmark)
+  }
+
+  async function openSpotlight(): Promise<void> {
+    if (spotlightOpen || anyBlockingModalOpen()) return
+    if (currentView !== 'home' || !canSeeHome) return
+    await ensureSearchSpotlightComponent()
+    // 懒加载是异步的：其间可能开了模态或切了视图/登出。加载完成后重新校验，
+    // 否则会与刚打开的模态并发出现，破坏 D-e 模态互斥与单槽滚动锁。
+    if (spotlightOpen || anyBlockingModalOpen()) return
+    if (currentView !== 'home' || !canSeeHome) return
+    spotlightOpen = true
+  }
+
+  function closeSpotlight(): void {
+    spotlightOpen = false
+  }
+
+  function openBookmarkView(bookmark: PublicBookmark): void {
+    viewBookmark = bookmark
+  }
+
+  function closeBookmarkView(): void {
+    viewBookmark = null
+  }
+
+  // 全局快捷键集中在 App：Ctrl+K / Cmd+K / 「/」 唤起 Spotlight，Esc 关闭。
+  // 排除输入态与 IME；仅首页可见时生效；模态互斥由 openSpotlight 内部把关。
+  function handleGlobalKeyDown(event: KeyboardEvent): void {
+    const target = event.target as HTMLElement | null
+    const typing = Boolean(target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable))
+    if (event.isComposing || event.key === 'Process' || typing) return
+    if (currentView !== 'home' || !canSeeHome) return
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault()
+      if (spotlightOpen) closeSpotlight()
+      else void openSpotlight()
+      return
+    }
+    if (event.key === '/' && !spotlightOpen) {
+      event.preventDefault()
+      void openSpotlight()
+      return
+    }
+    if (event.key === 'Escape' && spotlightOpen) {
+      event.preventDefault()
+      closeSpotlight()
+    }
+  }
 
   let categoryModalMode: 'create' | 'edit' = 'create'
   let bookmarkModalMode: 'create' | 'edit' = 'create'
@@ -201,6 +284,7 @@
   let systemPrefersDark = false
   let mediaQuery: MediaQueryList | null = null
   let handleSystemThemeChange: ((event: MediaQueryListEvent) => void) | null = null
+  let stopPublicDataFocusRefresh: (() => void) | null = null
 
   $: resolvedThemeState = resolveAppThemeState({
     preferredThemeMode,
@@ -514,6 +598,7 @@
     activeCategory = null
     categoryError = ''
     savingCategory = false
+    categoryCreateReturnToHome = false
   }
 
   function resetSettingsState(): void {
@@ -529,14 +614,15 @@
     savingBookmark = false
   }
 
-  async function handleOpenLogin(): Promise<void> {
+  async function openLoginUseCase(): Promise<void> {
     rootError = ''
     authStore.resetError()
     await ensureLoginModalComponent()
     loginModalOpen = true
-    if (!canSeeHome) {
-      currentView = 'login'
-    }
+    if (!canSeeHome) currentView = 'login'
+  }
+  async function handleOpenLogin(): Promise<void> {
+    await openLoginUseCase()
   }
 
   async function handleCloseLogin(): Promise<void> {
@@ -551,6 +637,69 @@
   }
 
   async function handleSwitchToAdmin(): Promise<void> {
+    await openAdminUseCase()
+  }
+
+  async function completeLoginUseCase(payload: { username: string; password: string }): Promise<void> {
+    await authStore.login(payload.username, payload.password)
+    loginModalOpen = false
+    rootError = ''
+    await refreshLoggedInData(true)
+    if (isAdminPath()) {
+      await ensureAdminComponent()
+      currentView = 'admin'
+      return
+    }
+    currentView = 'home'
+  }
+  async function handleLogin(payload: { username: string; password: string }): Promise<void> {
+    try {
+      await completeLoginUseCase(payload)
+    } catch {
+      // authStore 已经记录错误
+    }
+  }
+
+  async function completeLogoutUseCase(previousSettings: Settings | null): Promise<string | null> {
+    const revocationWarning = logoutRevocationWarning(await authStore.logout())
+    resetCategoryState()
+    resetSettingsState()
+    resetBookmarkState()
+    adminStore.reset()
+    await clearCachedAdminData()
+    if (previousSettings) {
+      applyConfigFromSettings(previousSettings)
+    }
+    await refreshPublicData()
+    return revocationWarning
+  }
+
+  async function handleLogout(): Promise<void> {
+    rootError = ''
+    const previousSettings = get(adminStore).data.settings
+
+    try {
+      const revocationWarning = await completeLogoutUseCase(previousSettings)
+
+      const homeGate = createHomeGateState({
+        publicMode: get(configStore).data?.public_mode,
+        authenticated: false,
+      })
+      if (homeGate.loginModalOpen) {
+        await ensureLoginModalComponent()
+      }
+      loginModalOpen = homeGate.loginModalOpen
+      currentView = homeGate.view
+      // 视图先切换，确保全局 Toast 不被登出后的页面切换影响。
+      if (revocationWarning) {
+        toastStore.addToast(revocationWarning, 'error', { duration: 12000 })
+      }
+    } catch (error) {
+      rootError = getErrorMessage(error)
+    }
+  }
+
+  async function openAdminUseCase(): Promise<void> {
     if (!isLoggedIn()) {
       await handleOpenLogin()
       return
@@ -564,71 +713,36 @@
     replaceBrowserPath('/admin')
     currentView = 'admin'
   }
-
-  async function handleLogin(payload: { username: string; password: string }): Promise<void> {
-    try {
-      await authStore.login(payload.username, payload.password)
-      loginModalOpen = false
-      rootError = ''
-      await refreshLoggedInData(true)
-      if (isAdminPath()) {
-        await ensureAdminComponent()
-        currentView = 'admin'
-      } else {
-        currentView = 'home'
-      }
-    } catch {
-      // authStore 已经记录错误
-    }
-  }
-
-  async function handleLogout(): Promise<void> {
-    rootError = ''
-    const previousSettings = get(adminStore).data.settings
-
-    try {
-      await authStore.logout()
-      resetCategoryState()
-      resetSettingsState()
-      resetBookmarkState()
-      adminStore.reset()
-      await clearCachedAdminData()
-      if (previousSettings) {
-        applyConfigFromSettings(previousSettings)
-      }
-      await refreshPublicData()
-      const homeGate = createHomeGateState({
-        publicMode: get(configStore).data?.public_mode,
-        authenticated: false,
-      })
-      if (homeGate.loginModalOpen) {
-        await ensureLoginModalComponent()
-      }
-      loginModalOpen = homeGate.loginModalOpen
-      currentView = homeGate.view
-    } catch (error) {
-      rootError = getErrorMessage(error)
-    }
-  }
-
-  async function handleOpenCreateCategory(): Promise<void> {
+  async function openCreateCategoryUseCase(returnToHome: boolean): Promise<boolean> {
     if (!isLoggedIn()) {
       await handleOpenLogin()
-      return
+      return false
     }
+
+    if (!await ensureLoggedInDataLoaded()) {
+      return false
+    }
+
+    if (returnToHome) await ensureCategoryEditModalComponent()
+    else await ensureAdminComponent()
+    return true
+  }
+  async function handleOpenCreateCategory(parentId: string | number | null = null, returnToHomeOverride: boolean | undefined = undefined): Promise<void> {
+    const returnToHome = returnToHomeOverride ?? parentId != null
+    if (!await openCreateCategoryUseCase(returnToHome)) return
 
     categoryError = ''
-    if (!await ensureLoggedInDataLoaded()) {
-      return
-    }
-    await ensureAdminComponent()
+    categoryCreateReturnToHome = returnToHome
     categoryModalMode = 'create'
-    activeCategory = createCategoryDraft()
+    activeCategory = createCategoryDraft(parentId)
     categoryModalOpen = true
-    currentView = 'admin'
+    if (!returnToHome) currentView = 'admin'
+  }
+  async function handleOpenCreateRootCategory(): Promise<void> {
+    await handleOpenCreateCategory(null, true)
   }
 
-  async function handleEditCategory(category: { id: string | number }): Promise<void> {
+  async function openEditCategoryUseCase(category: { id: string | number }): Promise<void> {
     const current = adminData.categories.find((item) => item.id === Number(category.id))
     if (!current) return
 
@@ -637,35 +751,51 @@
     activeCategory = toCategoryForm(current)
     categoryModalOpen = true
   }
+  async function handleEditCategory(category: { id: string | number }): Promise<void> {
+    await openEditCategoryUseCase(category)
+  }
 
   async function handleCloseCategoryModal(): Promise<void> {
     resetCategoryState()
   }
 
-  async function handleSubmitCategory(form: CategoryFormValue): Promise<void> {
+  async function submitCategoryUseCase(form: CategoryFormValue): Promise<void> {
+    const returnToHome = categoryCreateReturnToHome
+    // 提交意图只看表单本身。`resetCategoryState()` 会把 categoryModalMode 改回 'create'，
+    // 在它之后再读 mode 就会让编辑也提示「已创建」——这条提示语曾经一直是「已创建」。
+    const isEdit = form.id != null
     savingCategory = true
     categoryError = ''
 
-    try {
-      let category: Category
-      if (categoryModalMode === 'edit' && form.id != null) {
-        category = await api.categories.update(Number(form.id), toCategoryPayload(form))
-      } else {
-        category = await api.categories.create(toCategoryPayload(form))
-      }
-
-     resetCategoryState()
-     await applyLocalCategoryUpsert(category)
-      await refreshAdminDataAfterMutation()
-      toastStore.addToast(
-        categoryModalMode === 'edit' ? `分类「${category.title}」已更新` : `分类「${category.title}」已创建`,
-        'success',
-      )
-   } catch (error) {
-     categoryError = getErrorMessage(error)
-    } finally {
-      savingCategory = false
-    }
+    await runAdminMutation({
+      run: () =>
+        isEdit
+          ? api.categories.update(Number(form.id), toCategoryPayload(form))
+          : api.categories.create(toCategoryPayload(form)),
+      onSuccess: async (category) => {
+        resetCategoryState()
+        await applyLocalCategoryUpsert(category)
+        await refreshAdminDataAfterMutation()
+        if (returnToHome) {
+          currentView = 'home'
+          homeFocusCategoryId = null
+          await tick()
+          homeFocusCategoryId = category.id
+          await tick()
+        }
+      },
+      successMessage: (category) =>
+        isEdit ? `分类「${category.title}」已更新` : `分类「${category.title}」已创建`,
+      onError: (message) => {
+        categoryError = message
+      },
+      onSettled: () => {
+        savingCategory = false
+      },
+    })
+  }
+  async function handleSubmitCategory(form: CategoryFormValue): Promise<void> {
+    await submitCategoryUseCase(form)
   }
 
   async function handleDeleteCategory(category: { id: string | number; title: string }): Promise<void> {
@@ -679,19 +809,23 @@
     ))
     if (!confirmed) return
 
-    deletingCategoryId = Number(category.id)
+    deletingCategoryId = categoryId
     categoryError = ''
 
-    try {
-     await api.categories.remove(categoryId)
-     await applyLocalCategoryDelete(categoryId)
-      await refreshAdminDataAfterMutation()
-      toastStore.addToast(`分类「${category.title}」已删除`, 'success')
-   } catch (error) {
-     categoryError = getErrorMessage(error)
-    } finally {
-      deletingCategoryId = null
-    }
+    await runAdminMutation({
+      run: () => api.categories.remove(categoryId),
+      onSuccess: async () => {
+        await applyLocalCategoryDelete(categoryId)
+        await refreshAdminDataAfterMutation()
+      },
+      successMessage: () => `分类「${category.title}」已删除`,
+      onError: (message) => {
+        categoryError = message
+      },
+      onSettled: () => {
+        deletingCategoryId = null
+      },
+    })
   }
 
   async function handleOpenCreateBookmark(categoryId?: string | number): Promise<void> {
@@ -741,63 +875,85 @@
   }
 
   async function handleSubmitBookmark(form: BookmarkFormValue): Promise<void> {
+    // 同 handleSubmitCategory：意图只看表单，resetBookmarkState() 之后 mode 已经变回 'create'。
+    const isEdit = form.id != null
     savingBookmark = true
     bookmarkError = ''
 
-    try {
-      let bookmark: Bookmark
-      if (bookmarkModalMode === 'edit' && form.id != null) {
-        bookmark = await api.bookmarks.update(Number(form.id), toBookmarkPayload(form))
-      } else {
-        bookmark = await api.bookmarks.create(toBookmarkPayload(form))
-      }
-
-      resetBookmarkState()
-      await applyLocalBookmarkUpsert(bookmark)
-      await refreshAdminDataAfterMutation()
-     refreshBookmarkIconCacheInBackground(bookmark.id)
-      toastStore.addToast(
-        bookmarkModalMode === 'edit' ? `书签「${bookmark.title}」已更新` : `书签「${bookmark.title}」已创建`,
-        'success',
-      )
-   } catch (error) {
-     bookmarkError = getErrorMessage(error)
-    } finally {
-      savingBookmark = false
-    }
+    await runAdminMutation({
+      run: () =>
+        isEdit
+          ? api.bookmarks.update(Number(form.id), toBookmarkPayload(form))
+          : api.bookmarks.create(toBookmarkPayload(form)),
+      onSuccess: async (bookmark) => {
+        resetBookmarkState()
+        await applyLocalBookmarkUpsert(bookmark)
+        await refreshAdminDataAfterMutation()
+        refreshBookmarkIconCacheInBackground(bookmark.id)
+      },
+      successMessage: (bookmark) =>
+        isEdit ? `书签「${bookmark.title}」已更新` : `书签「${bookmark.title}」已创建`,
+      onError: (message) => {
+        bookmarkError = message
+      },
+      onSettled: () => {
+        savingBookmark = false
+      },
+    })
   }
 
   async function handleDeleteBookmark(bookmark: { id: string | number; title: string }): Promise<void> {
     const confirmed = await requestConfirmation(createDeleteBookmarkConfirmation(bookmark.title))
     if (!confirmed) return
 
-    deletingBookmarkId = Number(bookmark.id)
+    const bookmarkId = Number(bookmark.id)
+    deletingBookmarkId = bookmarkId
     bookmarkError = ''
 
-    try {
-      const bookmarkId = Number(bookmark.id)
-      await api.bookmarks.remove(bookmarkId)
-      resetBookmarkState()
-     await applyLocalBookmarkDelete(bookmarkId)
-     await refreshAdminDataAfterMutation()
-      toastStore.addToast(`书签「${bookmark.title}」已删除`, 'success')
-   } catch (error) {
-     bookmarkError = getErrorMessage(error)
-    } finally {
-      deletingBookmarkId = null
-    }
+    await runAdminMutation({
+      run: () => api.bookmarks.remove(bookmarkId),
+      onSuccess: async () => {
+        resetBookmarkState()
+        await applyLocalBookmarkDelete(bookmarkId)
+        await refreshAdminDataAfterMutation()
+      },
+      successMessage: () => `书签「${bookmark.title}」已删除`,
+      onError: (message) => {
+        bookmarkError = message
+      },
+      onSettled: () => {
+        deletingBookmarkId = null
+      },
+    })
   }
 
   async function handleBatchDeleteBookmarks(ids: number[]): Promise<void> {
     if (ids.length === 0) return
     if (!await requestConfirmation(createBatchDeleteConfirmation('bookmark', ids.length))) return
-    try {
-      const result = await api.bookmarks.batchDelete(ids)
-      if (result.deleted > 0) await refreshAdminDataAfterMutation()
-      toastStore.addToast(`已删除 ${result.deleted} 个书签`, 'success')
-    } catch (error) {
-      bookmarkError = getErrorMessage(error)
-    }
+
+    await runAdminMutation({
+      run: () => api.bookmarks.batchDelete(ids),
+      onSuccess: async (result) => {
+        if (result.deleted > 0) await refreshAdminDataAfterMutation()
+      },
+      successMessage: (result) => `已删除 ${result.deleted} 个书签`,
+      onError: (message) => {
+        bookmarkError = message
+      },
+    })
+  }
+  async function handleBatchMoveBookmarks(payload: BookmarkBatchMoveReq): Promise<void> {
+    bookmarkError = ''
+
+    await runAdminMutation({
+      run: () => api.bookmarks.batchMove(payload),
+      onSuccess: () => refreshAdminDataAfterMutation(),
+      successMessage: (result) => `已移动 ${result.moved} 个书签`,
+      onError: (message) => {
+        bookmarkError = message
+      },
+      rethrow: true,
+    })
   }
 
   async function handleBatchDeleteCategories(ids: number[]): Promise<void> {
@@ -807,28 +963,34 @@
       category.parent_id != null && ids.includes(category.parent_id)
     )).length
     if (!await requestConfirmation(createBatchDeleteConfirmation('category', ids.length, bookmarkCount, childCategoryCount))) return
-    try {
-      const result = await api.categories.batchDelete(ids)
-      if (result.deleted > 0 || result.deleted_bookmarks > 0) await refreshAdminDataAfterMutation()
-      toastStore.addToast(`已删除 ${result.deleted} 个分类及 ${result.deleted_bookmarks} 个书签`, 'success')
-    } catch (error) {
-      categoryError = getErrorMessage(error)
-    }
+
+    await runAdminMutation({
+      run: () => api.categories.batchDelete(ids),
+      onSuccess: async (result) => {
+        if (result.deleted > 0 || result.deleted_bookmarks > 0) await refreshAdminDataAfterMutation()
+      },
+      successMessage: (result) => `已删除 ${result.deleted} 个分类及 ${result.deleted_bookmarks} 个书签`,
+      onError: (message) => {
+        categoryError = message
+      },
+    })
   }
 
   async function handleSubmitSettings(payload: SettingsSubset): Promise<void> {
     savingSettings = true
     settingsError = ''
 
-    try {
-      const settings = await api.settings.update(payload)
-     await applyLocalSettings(settings)
-      toastStore.addToast('设置已保存', 'success')
-   } catch (error) {
-     settingsError = getErrorMessage(error)
-    } finally {
-      savingSettings = false
-    }
+    await runAdminMutation({
+      run: () => api.settings.update(payload),
+      onSuccess: (settings) => applyLocalSettings(settings),
+      successMessage: () => '设置已保存',
+      onError: (message) => {
+        settingsError = message
+      },
+      onSettled: () => {
+        savingSettings = false
+      },
+    })
   }
 
   async function handleChangePassword(payload: ChangePasswordReq): Promise<void> {
@@ -877,18 +1039,22 @@
     })
   }
 
-  // 首页按分类内拖拽排序：只给出该分类内的新顺序，这里据此重建“全量有序 id 列表”，
-  // 仅替换该分类占据的槽位，其它书签位置保持不变，从而保持全局 sort 与后台平铺表一致。
-  async function handleSortBookmarksInCategory(
-    categoryId: number,
-    orderedIdsInCategory: number[],
+  // 跨分类整理是全量提交：失败时草稿与服务端状态已不一致，
+  // 先按兄弟排序处理器的约定回滚到服务端数据，再把原始错误交给首页展示。
+  async function handleReorganizeBookmarks(
+    categoryOrders: BookmarkReorganizeReq['category_orders'],
   ): Promise<void> {
-    const current = get(publicStore).data?.bookmarks ?? get(adminStore).data.bookmarks
-    await handleSortBookmarks(buildOrderedBookmarkIdsForCategory(current, categoryId, orderedIdsInCategory))
+    try {
+      await api.bookmarks.reorganize(categoryOrders)
+    } catch (error) {
+      await refreshLoggedInData(true)
+      throw error
+    }
+    await refreshAdminDataAfterMutation()
   }
 
-  function handleExportData(): void {
-    exportDataToFile(importExportState, adminData, (next) => {
+  async function handleExportData(selection: BackupSelectionInput): Promise<void> {
+    await exportDataToFile(importExportState, selection, (next) => {
       importExportState = next
     })
   }
@@ -907,6 +1073,28 @@
       await refreshAdminDataAfterMutation()
     }
   }
+  async function handleRecovered(session: LoginResp): Promise<void> {
+    recoverActive = false
+    await enterInstalledApp(session)
+  }
+  function handleGoInstall(): void {
+    replaceBrowserPath('/install')
+    recoverActive = false
+    installState = { type: 'checking' }
+    void initializeApp()
+  }
+  function handleRecoverCancel(): void {
+    replaceBrowserPath('/')
+    recoverActive = false
+    installState = { type: 'checking' }
+    void initializeApp()
+  }
+  function handleForgotPassword(): void {
+    // 忘记密码是登录态的子流程，按模态语义处理：不改 URL，避免 pushState 制造一个没有
+    // popstate 监听的历史项（后退键会让 URL 与视图错位）。直达 /recover 仍由 onMount 处理。
+    loginModalOpen = false
+    recoverActive = true
+  }
 
   onMount(() => {
     preferredThemeMode = readPreferredThemeMode()
@@ -922,8 +1110,15 @@
       mediaQuery.addEventListener('change', handleSystemThemeChange)
     }
 
+    if (typeof window !== 'undefined' && isRecoverPath(window.location.pathname)) {
+      recoverActive = true
+      booting = false
+      return
+    }
     void initializeApp()
     scheduleBookmarkIconCachePrune()
+    // 切回已打开的标签页时按版本门控刷新公开数据（Issue #25 跨标签页设置同步）。
+    stopPublicDataFocusRefresh = installPublicDataFocusRefresh(() => refreshPublicData())
   })
 
   onDestroy(() => {
@@ -932,10 +1127,19 @@
     }
     // 不 revoke 的话每次重建都会漏一个 blob URL。
     customScriptController?.destroy()
+    stopPublicDataFocusRefresh?.()
   })
 </script>
 
-{#if installView}
+<svelte:window on:keydown={handleGlobalKeyDown} />
+
+{#if recoverActive}
+  <Recover
+    onRecovered={handleRecovered}
+    onGoInstall={handleGoInstall}
+    onCancel={handleRecoverCancel}
+  />
+{:else if installView}
   <Install
     mode={installView.mode}
     missingBindings={installView.missingBindings}
@@ -991,15 +1195,19 @@
           title={homeTitle}
           isAuthenticated={$isAuthenticated}
           authLoading={$authStore.loading}
+          onOpenCreateCategory={handleOpenCreateCategory}
+          onOpenCreateRootCategory={handleOpenCreateRootCategory}
+          focusCategoryId={homeFocusCategoryId}
           onOpenCreateBookmark={handleOpenCreateBookmark}
           onEditBookmark={handleEditBookmark}
-          onSortBookmarksInCategory={handleSortBookmarksInCategory}
+          onReorganizeBookmarks={handleReorganizeBookmarks}
           onSwitchToAdmin={handleSwitchToAdmin}
           onLogout={handleLogout}
           onOpenLogin={handleOpenLogin}
           activeTheme={activeTheme}
           activeThemeMode={themeMode}
           onToggleTheme={handleToggleTheme}
+          onOpenSearch={openSpotlight}
         />
       </div>
     {:else if currentView === 'login'}
@@ -1057,12 +1265,14 @@
         onEditBookmark={handleEditBookmark}
         onDeleteBookmark={handleDeleteBookmark}
         onBatchDeleteBookmarks={handleBatchDeleteBookmarks}
+        onBatchMoveBookmarks={handleBatchMoveBookmarks}
         onSubmitSettings={handleSubmitSettings}
         onChangePassword={handleChangePassword}
         onSortCategories={handleSortCategories}
         onSortBookmarks={handleSortBookmarks}
         onSelectTab={handleAdminTabChange}
         importing={importExportState.importing}
+        exporting={importExportState.exporting}
         backupError={importExportState.backupError}
         backupMessage={importExportState.backupMessage}
         onExportData={handleExportData}
@@ -1108,6 +1318,7 @@
         error={$authStore.error ?? ''}
         onSubmit={handleLogin}
         onCancel={handleCloseLogin}
+        onForgotPassword={handleForgotPassword}
       />
     {/if}
 
@@ -1127,6 +1338,35 @@
         imageHostUrl={adminData.settings?.image_host_url ?? ''}
       />
     {/if}
+    {#if CategoryEditModalComponent && categoryCreateReturnToHome}
+      <svelte:component
+        this={CategoryEditModalComponent}
+        open={categoryModalOpen}
+        loading={savingCategory}
+        error={categoryError}
+        mode={categoryModalMode}
+        value={activeCategory}
+        categories={adminCategories}
+        onSubmit={handleSubmitCategory}
+        onCancel={handleCloseCategoryModal}
+        imageHostUrl={adminData.settings?.image_host_url ?? ''}
+      />
+    {/if}
+    {#if SearchSpotlightComponent}
+      <svelte:component
+        this={SearchSpotlightComponent}
+        open={spotlightOpen}
+        bookmarks={publicData?.bookmarks ?? []}
+        categories={publicData?.categories ?? []}
+        onClose={closeSpotlight}
+        onViewBookmark={openBookmarkView}
+      />
+    {/if}
+
+    {#if viewBookmark}
+      <BookmarkLinkModal title={viewBookmark.title} url={viewBookmark.url} onClose={closeBookmarkView} />
+    {/if}
+
 
     <ConfirmDialog
       open={Boolean(confirmDialog)}
